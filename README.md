@@ -33,7 +33,9 @@ local working hours.
   `modified` instances (with `before`/`after`)
 - `/alarms` expands `VALARM` reminders for every instance in a window:
   a master event's alarms apply to each recurring instance, overrides
-  carry their own, and `REPEAT`/`DURATION` fan alarms out
+  carry their own, and `REPEAT`/`DURATION` fan alarms out — with each
+  series expanded far enough past the window that relative triggers
+  reaching into it are never missed
 - `/attendance` reports each windowed instance's `ATTENDEE` responses:
   recurring instances inherit the master's attendees, a `RECURRENCE-ID`
   override that declares any `ATTENDEE` replaces the whole list (one
@@ -674,10 +676,13 @@ unchanged March 2/16/23 standups are not reported:
 
 ### `POST /alarms`
 
-Expands the `VALARM` reminders of every `VEVENT` instance that overlaps the
-query window, returning only reminders whose **trigger instant** falls
-inside `[window_start, window_end)`. Request body is the same shape as
-`/expand`:
+Expands the `VALARM` reminders of every `VEVENT` instance and returns the
+reminders whose **trigger instant** falls inside
+`[window_start, window_end)`. A relative trigger can fire while its
+instance lies outside the window (a `-P2D` reminder fires two days before
+an instance that starts after the window), so each series is expanded
+over a range back-computed from its own relative triggers — never a fixed
+padding. Request body is the same shape as `/expand`:
 
 | Field          | Type   | Description                                        |
 | -------------- | ------ | -------------------------------------------------- |
@@ -1321,7 +1326,8 @@ beyond 1000 reminders, or an unknown `TZID` on an absolute trigger. All
 `VALARM`s are validated eagerly, so an unsupported alarm yields `422`
 even when its trigger lies outside the window; calendar-level failures
 (unparsable ICS, bad window, invalid recurrence) reuse the `/expand`
-checks.
+checks, with the 10 000-occurrence per-UID cap judged over the
+alarm-widened expansion range.
 
 `/attendance` additionally returns `422` when one effective attendee
 list contains the same address more than once with conflicting
@@ -1444,6 +1450,16 @@ types) are normal request-validation `422`s.
 - **Repeats**: `REPEAT:n` plus `DURATION:d` produces `n + 1` triggers at
   `base, base+d, …, base+n*d`. Reminders are filtered afterwards, so only
   the ones landing in the half-open window are returned.
+- **Instance expansion range**: a reminder can land inside the window
+  while its instance does not overlap it, so each UID group is expanded
+  over the query window widened by exactly that group's relative-trigger
+  reach — backwards by the latest possible trigger offset (delta +
+  `REPEAT` × `DURATION`, plus the event duration for `RELATED=END`) and
+  forwards by the earliest one. The range is derived from the authored
+  alarms, never a fixed number of days, and the per-UID 10 000-occurrence
+  cap is enforced on this widened range. Absolute `DATE-TIME` triggers
+  pin no instance time: they widen nothing and are still matched purely
+  by trigger time.
 - **Eager validation**: every `VALARM` in the supplied calendar is
   validated regardless of whether its event or trigger intersects the
   window; an unsupported or malformed alarm fails the whole request with

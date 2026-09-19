@@ -356,6 +356,211 @@ def test_multiple_alarms_on_one_instance_all_returned():
 
 
 # ---------------------------------------------------------------------------
+# Cross-window reminders: the trigger lands inside the window although the
+# event instance itself does not overlap it
+# ---------------------------------------------------------------------------
+
+def test_negative_trigger_reaches_back_to_an_instance_after_the_window():
+    # TRIGGER:-P2D fires two days before the start; the instance begins
+    # after the window, but its reminder lands inside it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260120T090000Z",
+        "DTEND:20260120T100000Z",
+        alarm("TRIGGER:-P2D", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-15T00:00:00Z", "2026-01-19T00:00:00Z")
+    assert rows(resp) == [("2026-01-18T09:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_recurring_instance_reminder_fires_in_an_instance_free_window():
+    # Weekly Mondays 09:00 (Jan 5/12/19); the -2 day reminder for the
+    # Jan 12 instance fires on Saturday Jan 10, inside a weekend window
+    # that no instance overlaps.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        alarm("TRIGGER:-P2D", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-10T00:00:00Z", "2026-01-11T00:00:00Z")
+    assert rows(resp) == [
+        ("2026-01-10T09:00:00Z", "evt-1", "2026-01-12T09:00:00Z", "Reminder")
+    ]
+
+
+def test_positive_trigger_reaches_forward_to_an_instance_before_the_window():
+    # TRIGGER:PT2H fires two hours after the 09:00 start; the instance is
+    # over before the window begins, but the reminder lands inside it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:PT2H", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-05T10:30:00Z", "2026-01-05T12:00:00Z")
+    assert rows(resp) == [("2026-01-05T11:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_positive_trigger_related_end_reaches_into_a_later_window():
+    # RELATED=END with +26h fires the next day, so the back-computed
+    # expansion range must include the event's duration.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER;RELATED=END:PT26H", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-06T00:00:00Z", "2026-01-07T00:00:00Z")
+    assert rows(resp) == [("2026-01-06T12:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_repeat_fanout_last_trigger_lands_inside_the_window():
+    # -15min with two hourly repeats fires 08:45 / 09:45 / 10:45; only the
+    # last trigger survives the window, and the instance itself does not
+    # overlap it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        alarm("TRIGGER:-PT15M", "REPEAT:2", "DURATION:PT1H", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-05T10:30:00Z", "2026-01-05T12:00:00Z")
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-05T10:45:00Z",
+    ]
+
+
+def test_cross_window_trigger_at_window_start_is_included():
+    # The half-open window rule is unchanged on the padded path: a trigger
+    # exactly at window_start is included...
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260120T090000Z",
+        "DTEND:20260120T100000Z",
+        alarm("TRIGGER:-P2D", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-18T09:00:00Z", "2026-01-19T00:00:00Z")
+    assert rows(resp) == [("2026-01-18T09:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_cross_window_trigger_at_window_end_is_excluded():
+    # ...and one exactly at window_end is excluded.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260120T090000Z",
+        "DTEND:20260120T100000Z",
+        alarm("TRIGGER:-P2D", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-17T00:00:00Z", "2026-01-18T09:00:00Z")
+    assert resp.json()["count"] == 0
+    assert resp.json()["alarms"] == []
+
+
+def test_cross_window_trigger_with_tzid_event():
+    # 09:00 New York on Mar 9 is EDT (UTC-4) = 13:00Z; the -1 day reminder
+    # fires 24h earlier (Mar 8 13:00Z, the spring-forward day), inside a
+    # window the Mar 9 instance does not overlap.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART;TZID=America/New_York:20260309T090000",
+        "DTEND;TZID=America/New_York:20260309T100000",
+        alarm("TRIGGER:-P1D", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-03-08T00:00:00Z", "2026-03-09T00:00:00Z")
+    assert rows(resp) == [("2026-03-08T13:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_exdated_occurrence_fires_no_cross_window_reminder():
+    # The Jan 12 occurrence is EXDATEd, so its would-be cross-window
+    # reminder on Jan 10 is not produced.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=3",
+        "EXDATE:20260112T090000Z",
+        alarm("TRIGGER:-P2D", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-10T00:00:00Z", "2026-01-11T00:00:00Z")
+    assert resp.json()["count"] == 0
+
+
+def test_cancelled_override_fires_no_cross_window_reminder():
+    # A STATUS:CANCELLED override removes the Jan 12 occurrence; its -2 day
+    # reminder (Jan 10 09:00) must not fire either.
+    ics = cal(
+        event(
+            "UID:evt-1",
+            "DTSTART:20260105T090000Z",
+            "DTEND:20260105T100000Z",
+            "RRULE:FREQ=WEEKLY;COUNT=3",
+            alarm("TRIGGER:-P2D", *DISPLAY),
+        ),
+        event(
+            "UID:evt-1",
+            "RECURRENCE-ID:20260112T090000Z",
+            "DTSTART:20260112T090000Z",
+            "DTEND:20260112T100000Z",
+            "STATUS:CANCELLED",
+        ),
+    )
+    resp = alarms(ics, "2026-01-10T00:00:00Z", "2026-01-11T00:00:00Z")
+    assert resp.json()["count"] == 0
+
+
+def test_override_moved_out_of_window_fires_its_own_reminder_inside():
+    # The Jan 12 occurrence is moved to Jan 20 and carries its own -3 day
+    # alarm, firing Jan 17 11:00 — inside a window neither the override
+    # instance nor any master instance overlaps. The master's -1h alarm
+    # still does not apply to the overridden instance.
+    ics = cal(
+        weekly_master(),
+        event(
+            "UID:evt-1",
+            "RECURRENCE-ID:20260112T090000Z",
+            "DTSTART:20260120T110000Z",
+            "DTEND:20260120T120000Z",
+            alarm("TRIGGER:-P3D", "ACTION:DISPLAY", "DESCRIPTION:Override ping"),
+        ),
+    )
+    resp = alarms(ics, "2026-01-16T00:00:00Z", "2026-01-18T00:00:00Z")
+    assert rows(resp) == [
+        ("2026-01-17T11:00:00Z", "evt-1", "2026-01-12T09:00:00Z", "Override ping")
+    ]
+
+
+def test_absolute_trigger_does_not_pull_out_of_window_instances_in():
+    # Absolute DATE-TIME triggers pin no instance time: an instance lying
+    # wholly outside the window is not pulled in by its absolute alarm
+    # (the trigger is still only matched by its own instant).
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260120T090000Z",
+        "DTEND:20260120T100000Z",
+        alarm("TRIGGER;VALUE=DATE-TIME:20260110T090000Z", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-05T00:00:00Z", "2026-01-15T00:00:00Z")
+    assert resp.json()["count"] == 0
+
+
+def test_per_uid_occurrence_cap_still_applies_with_alarm_padding():
+    # Minutely over an 8-day window: 11520 candidates > 10000. The cap is
+    # enforced on the alarm-padded expansion just like on /expand.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260101T000000Z",
+        "DTEND:20260101T003000Z",
+        "RRULE:FREQ=MINUTELY",
+        alarm("TRIGGER:-PT15M", *DISPLAY),
+    ))
+    resp = alarms(ics, "2026-01-01T00:00:00Z", "2026-01-09T00:00:00Z")
+    assert resp.status_code == 422
+    assert "more than 10000 occurrences" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # Sorting: trigger time, then UID, then RECURRENCE-ID
 # ---------------------------------------------------------------------------
 
