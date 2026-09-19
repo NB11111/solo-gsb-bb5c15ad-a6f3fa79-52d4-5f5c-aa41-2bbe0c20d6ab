@@ -277,6 +277,173 @@ def test_non_recurring_event_alarm_has_null_recurrence_id():
 
 
 # ---------------------------------------------------------------------------
+# Cross-window reminders: the trigger lands inside the window although the
+# instance itself does not overlap it
+# ---------------------------------------------------------------------------
+
+def test_reminder_before_event_beyond_window_end():
+    # The event sits entirely after the window, but its 2-day-ahead
+    # reminder fires inside it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260202T090000Z",
+        "DTEND:20260202T100000Z",
+        alarm("TRIGGER:-P2D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert rows(resp) == [("2026-01-31T09:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_positive_trigger_after_event_before_window_start():
+    # The event ended before the window; the follow-up reminder anchored
+    # to DTEND fires inside it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20251228T090000Z",
+        "DTEND:20251228T100000Z",
+        alarm("TRIGGER;RELATED=END:P5D", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert rows(resp) == [("2026-01-02T10:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_positive_trigger_relative_to_start_before_window():
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20251230T090000Z",
+        "DTEND:20251230T100000Z",
+        alarm("TRIGGER:P3D", *DISPLAY),  # 3 days after the start
+    ))
+    resp = alarms(ics)
+    assert rows(resp) == [("2026-01-02T09:00:00Z", "evt-1", None, "Reminder")]
+
+
+def test_end_anchored_reminder_before_event_start_beyond_window():
+    # A 1-hour event just past the window with a reminder 2 hours before
+    # its end fires 1 hour before its start — inside the window.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260201T003000Z",
+        "DTEND:20260201T013000Z",
+        alarm("TRIGGER;RELATED=END:-PT2H", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert rows(resp) == [("2026-01-31T23:30:00Z", "evt-1", None, "Reminder")]
+
+
+def test_recurring_instance_beyond_window_end_reminder_inside():
+    # Weekly Mondays 09:00 with a 7-day-ahead reminder: every instance's
+    # reminder lands on the previous instance's slot. The Jan 26 instance
+    # is outside the window but its reminder (Jan 19) is inside.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=4",  # Jan 5/12/19/26
+        alarm("TRIGGER:-P7D", *DISPLAY),
+    ))
+    resp = alarms(
+        ics,
+        window_start="2026-01-12T00:00:00Z",
+        window_end="2026-01-26T00:00:00Z",
+    )
+    assert rows(resp) == [
+        ("2026-01-12T09:00:00Z", "evt-1", "2026-01-19T09:00:00Z", "Reminder"),
+        ("2026-01-19T09:00:00Z", "evt-1", "2026-01-26T09:00:00Z", "Reminder"),
+    ]
+
+
+def test_repeat_fanout_reaches_into_window_from_before():
+    # The event ends just before the window; only the later repeats of its
+    # post-event alarm land inside it.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20251231T220000Z",
+        "DTEND:20251231T230000Z",
+        # fires 23:00, 23:30, then 2026-01-01 00:00 and 00:30
+        alarm("TRIGGER:PT1H", "REPEAT:3", "DURATION:PT30M", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:30:00Z",
+    ]
+
+
+def test_repeat_fanout_from_instance_beyond_window_end():
+    # Event after the window; only the first of its repeated ahead-of-time
+    # reminders fires inside the window.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260201T030000Z",
+        "DTEND:20260201T040000Z",
+        # fires 2026-01-31 23:00, then 2026-02-01 00:00 and 01:00
+        alarm("TRIGGER:-PT4H", "REPEAT:2", "DURATION:PT1H", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert [a["trigger"] for a in resp.json()["alarms"]] == [
+        "2026-01-31T23:00:00Z",
+    ]
+
+
+def test_override_moved_out_of_window_keeps_its_reminder_inside():
+    # The override moves the Jan 12 instance to Feb 2 (outside the window)
+    # with its own 3-day-ahead alarm, which fires inside the window.
+    ics = cal(
+        weekly_master(),
+        event(
+            "UID:evt-1",
+            "RECURRENCE-ID:20260112T090000Z",
+            "DTSTART:20260202T090000Z",
+            "DTEND:20260202T100000Z",
+            alarm("TRIGGER:-P3D", "ACTION:DISPLAY", "DESCRIPTION:Override ping"),
+        ),
+    )
+    resp = alarms(ics)
+    assert rows(resp) == [
+        ("2026-01-05T08:00:00Z", "evt-1", "2026-01-05T09:00:00Z", "Reminder"),
+        ("2026-01-19T08:00:00Z", "evt-1", "2026-01-19T09:00:00Z", "Reminder"),
+        ("2026-01-30T09:00:00Z", "evt-1", "2026-01-12T09:00:00Z", "Override ping"),
+    ]
+
+
+def test_exdated_instance_beyond_window_still_fires_no_reminder():
+    # The Jan 19 instance is EXDATEd; its 7-day-ahead reminder would have
+    # fired inside the window (Jan 12) and must stay silent. The Jan 26
+    # instance is outside the window and its reminder (Jan 19) is inside.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260105T090000Z",
+        "DTEND:20260105T100000Z",
+        "RRULE:FREQ=WEEKLY;COUNT=4",  # Jan 5/12/19/26
+        "EXDATE:20260119T090000Z",
+        alarm("TRIGGER:-P7D", *DISPLAY),
+    ))
+    resp = alarms(
+        ics,
+        window_start="2026-01-10T00:00:00Z",
+        window_end="2026-01-20T00:00:00Z",
+    )
+    assert rows(resp) == [
+        ("2026-01-19T09:00:00Z", "evt-1", "2026-01-26T09:00:00Z", "Reminder"),
+    ]
+
+
+def test_absolute_trigger_of_instance_outside_window_stays_silent():
+    # Absolute triggers are filtered by their trigger time only; they are
+    # not back-projected onto instances outside the window.
+    ics = cal(event(
+        "UID:evt-1",
+        "DTSTART:20260202T090000Z",
+        "DTEND:20260202T100000Z",
+        alarm("TRIGGER;VALUE=DATE-TIME:20260115T090000Z", *DISPLAY),
+    ))
+    resp = alarms(ics)
+    assert resp.json()["count"] == 0
+    assert resp.json()["alarms"] == []
+
+
+# ---------------------------------------------------------------------------
 # Window filtering (half-open)
 # ---------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 """VALARM expansion for VEVENT instances.
 
-Each :class:`~app.expander.Instance` produced by the recurrence expander
+Each :class:`~app.recurrence.Instance` produced by the recurrence kernel
 carries the raw VALARM components of the event that defines it:
 
 * a master event's VALARMs apply to **every** expanded instance of the
@@ -18,6 +18,17 @@ reminders spaced by DURATION. Only reminders whose trigger instant falls
 inside the half-open query window ``[window_start, window_end)`` are
 returned.
 
+A reminder fires inside the window even when its instance does not overlap
+the window itself (a two-day-ahead reminder for an event just past
+``window_end``, a follow-up ping long after an event before
+``window_start``). The instance expansion is therefore back-projected from
+every duration TRIGGER — positive or negative, anchored at DTSTART or
+DTEND, including the final REPEAT/DURATION firing — by exactly the amounts
+the alarm definitions imply (never a fixed number of days). Absolute
+``DATE-TIME`` triggers do not move with the instance, so they are not
+back-projected: they keep firing for the instances overlapping the query
+window and are filtered by their trigger time only.
+
 Anything invalid or unsupported raises :class:`AlarmError`, which the HTTP
 layer maps to 422.
 """
@@ -28,8 +39,15 @@ import datetime as dt
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .expander import Instance, expand_parsed_calendar
-from .recurrence import _parse_calendar, _to_utc
+from .recurrence import (
+    Instance,
+    _event_times,
+    _overlaps,
+    _parse_calendar,
+    _to_utc,
+    compute_candidates,
+    group_events_by_uid,
+)
 
 UTC = dt.timezone.utc
 
@@ -67,30 +85,49 @@ class _AlarmSpec:
 def expand_alarms(
     ics_text: str, window_start: dt.datetime, window_end: dt.datetime
 ) -> list[Reminder]:
-    """Expand every VALARM of every VEVENT instance in the UTC window.
+    """Expand every VALARM whose reminders fire inside the UTC window.
 
-    Instances come from :func:`app.expander.expand_calendar`; an instance
-    whose event has no VALARMs contributes nothing. All VALARMs in the
-    calendar are validated eagerly (like the expander validates every
-    event), so an unsupported alarm yields 422 even if its trigger would
-    fall outside the window.
+    Instances come from the same recurrence kernel as /expand, computed per
+    UID over a window back-projected from the group's own duration TRIGGERs
+    (see :func:`_expansion_padding`), so a reminder is found even when its
+    instance does not overlap the query window itself. An instance whose
+    event has no VALARMs contributes nothing. All VALARMs in the calendar
+    are validated eagerly (like the expander validates every event), so an
+    unsupported alarm yields 422 even if its trigger would fall outside the
+    window.
     """
     calendar = _parse_calendar(ics_text)
-    instances: list[Instance] = expand_parsed_calendar(
-        calendar, window_start, window_end
-    )
 
+    # Eager validation of every VALARM in the calendar; the parsed specs
+    # also drive the instance-window back-projection below.
     specs: dict[int, _AlarmSpec] = {}
     for alarm in calendar.walk("VALARM"):
         specs[id(alarm)] = _parse_alarm(alarm)
 
     reminders: list[Reminder] = []
-    for instance in instances:
-        for alarm in instance.alarms:
-            spec = specs[id(alarm)]
-            reminders.extend(
-                _materialize(spec, instance, window_start, window_end)
+    for uid, events in group_events_by_uid(calendar).items():
+        pad_before, pad_after = _expansion_padding(events, specs)
+        inst_start = window_start - pad_before
+        inst_end = window_end + pad_after
+        for slot in compute_candidates(uid, events, inst_start, inst_end):
+            instance = slot.instance
+            if instance is None or not _overlaps(
+                instance.start, instance.end, inst_start, inst_end
+            ):
+                continue
+            in_window = _overlaps(
+                instance.start, instance.end, window_start, window_end
             )
+            for alarm in instance.alarms:
+                spec = specs[id(alarm)]
+                if isinstance(spec.trigger, dt.datetime) and not in_window:
+                    # Absolute triggers are not back-projected: they fire
+                    # for the instances overlapping the query window itself
+                    # and are filtered by their trigger time only.
+                    continue
+                reminders.extend(
+                    _materialize(spec, instance, window_start, window_end)
+                )
 
     no_rid = dt.datetime.min.replace(tzinfo=UTC)
     reminders.sort(
@@ -102,6 +139,59 @@ def expand_alarms(
         )
     )
     return reminders
+
+
+def _expansion_padding(
+    events: list, specs: dict[int, _AlarmSpec]
+) -> tuple[dt.timedelta, dt.timedelta]:
+    """How far one UID group's instance expansion must reach beyond the
+    query window for its reminders to be found.
+
+    A duration TRIGGER fires at ``anchor + delta`` (anchor = DTSTART, or
+    DTEND for ``RELATED=END``), and REPEAT/DURATION extends the fan-out to
+    ``anchor + delta + repeat * spacing``. An instance starting at ``t``
+    therefore fires inside ``[window_start, window_end)`` iff its first
+    trigger starts before the window ends and its last one does not end
+    before it begins::
+
+        window_start - (offset + fanout) <= t < window_end - offset
+        with offset = (duration if RELATED=END else 0) + delta
+
+    The returned ``(pad_before, pad_after)`` covers exactly those reaches —
+    derived from the authored TRIGGER/REPEAT/DURATION values, never a fixed
+    number of days. Absolute DATE-TIME triggers do not move with the
+    instance, so they contribute no padding.
+    """
+    masters = [e for e in events if "RECURRENCE-ID" not in e]
+    master = masters[0] if masters else None
+    master_duration = None
+    if master is not None:
+        start, end, _ = _event_times(master)
+        master_duration = end - start
+
+    pad_before = pad_after = dt.timedelta(0)
+    for event in events:
+        alarms = [c for c in event.subcomponents if c.name == "VALARM"]
+        if not alarms:
+            continue
+        if event is master:
+            duration = master_duration
+        else:
+            # An override without DTEND/DURATION inherits the master's
+            # duration, exactly as the expansion kernel applies it.
+            start, end, _ = _event_times(event, default_duration=master_duration)
+            duration = end - start
+        for alarm in alarms:
+            spec = specs[id(alarm)]
+            if isinstance(spec.trigger, dt.datetime):
+                continue  # absolute trigger: independent of the instance time
+            offset = spec.trigger
+            if spec.related_end:
+                offset = duration + offset
+            fanout = spec.repeat * spec.spacing
+            pad_before = max(pad_before, offset + fanout)
+            pad_after = max(pad_after, -offset)
+    return pad_before, pad_after
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,9 @@ local working hours.
   `modified` instances (with `before`/`after`)
 - `/alarms` expands `VALARM` reminders for every instance in a window:
   a master event's alarms apply to each recurring instance, overrides
-  carry their own, and `REPEAT`/`DURATION` fan alarms out
+  carry their own, `REPEAT`/`DURATION` fan alarms out, and relative
+  triggers are back-projected so a reminder is found even when its
+  instance lies outside the window
 - `/attendance` reports each windowed instance's `ATTENDEE` responses:
   recurring instances inherit the master's attendees, a `RECURRENCE-ID`
   override that declares any `ATTENDEE` replaces the whole list (one
@@ -674,10 +676,18 @@ unchanged March 2/16/23 standups are not reported:
 
 ### `POST /alarms`
 
-Expands the `VALARM` reminders of every `VEVENT` instance that overlaps the
-query window, returning only reminders whose **trigger instant** falls
-inside `[window_start, window_end)`. Request body is the same shape as
-`/expand`:
+Expands the `VALARM` reminders of every `VEVENT` instance and returns
+those whose **trigger instant** falls inside `[window_start, window_end)`.
+Because a duration `TRIGGER` can fire inside the window while its instance
+lies outside it (an ahead-of-time reminder for an event past `window_end`,
+a follow-up ping after an event before `window_start`), the instance
+expansion is back-projected from every relative `TRIGGER` — positive or
+negative, `RELATED=START` or `END`, including the final `REPEAT`/`DURATION`
+firing — by exactly the amounts the alarm definitions imply (never a fixed
+number of days). Absolute `DATE-TIME` triggers are independent of the
+instance time: they are not back-projected and remain filtered by trigger
+time for the instances overlapping the window. Request body is the same
+shape as `/expand`:
 
 | Field          | Type   | Description                                        |
 | -------------- | ------ | -------------------------------------------------- |
@@ -1436,6 +1446,14 @@ types) are normal request-validation `422`s.
   override replaces the master's alarms for that instance with its own
   (an override with no `VALARM`s has no reminders). Cancelled instances
   and `EXDATE`d occurrences never produce reminders.
+- **Window reach**: a reminder is returned when its trigger instant lands
+  in the half-open window, so the instance expansion is padded backwards
+  and forwards per `UID` by exactly each relative alarm's reach — the
+  trigger offset from DTSTART (or DTEND, which adds the event duration)
+  plus the `REPEAT`/`DURATION` fan-out — never by a fixed number of days.
+  Absolute `DATE-TIME` triggers contribute no padding: they fire for the
+  instances overlapping the query window and are filtered by trigger time
+  only. The per-`UID` expansion cap applies to the padded window.
 - **Triggers**: a duration-valued `TRIGGER` is added to the instance's
   DTSTART (default / `RELATED=START`) or DTEND (`RELATED=END`); signed
   durations point before (negative) or after (positive) the anchor. An
